@@ -1,7 +1,7 @@
 /**
  * @file timer.hpp
  * @author stroll (116356647@qq.com)
- * @brief
+ * @brief 定时器
  * @version 0.1
  * @date 2025-09-12
  *
@@ -55,6 +55,7 @@ inline bool operator<(const TimerHandler &left, const TimerHandler &right) {
     return left->next_tp < right->next_tp;
 }
 
+/// @brief 最小堆，用来存放定时任务，堆顶放置最优先执行的任务
 class MinHeap {
    public:
     MinHeap() { buff_.reserve(64); }
@@ -357,20 +358,36 @@ class TimerManager final {
     std::atomic<bool> exit_flag_{false};
 };
 
+/// @brief 定时器对外类
 class Timer {
    public:
+    /// @brief 构造一个定时器对象
+    /// @param name 定时器名称
+    /// @param func 定时器定期执行的任务
+    /// @param interval_ms 定时器定期执行任务的周期,如果为0，则只执行一次， 单位为ms
+    /// @param delay_ms 第一次延迟执行的时间，stop后重新start的话也会生效 
     Timer(const char *name, const TimerFunc &func, unsigned interval_ms, unsigned delay_ms = 0) {
         handler_ = TimerManager::instance().add_timer(name, func, interval_ms, delay_ms);
     }
 
+    /// @brief 销毁定时器对象
     ~Timer() { TimerManager::instance().stop(handler_); }
 
+    /// @brief 开始定时器, 对于只执行一次的任务，start后会重新执行
+    /// @return 
     int start() { return TimerManager::instance().start(handler_); }
 
+    /// @brief 停止定时器
+    /// @return 
     int stop() { return TimerManager::instance().stop(handler_); }
 
+    /// @brief 设置周期任务间隔
+    /// @param ms 
+    /// @return 
     int set_interval(unsigned ms) { return TimerManager::instance().set_interval(handler_, ms); }
 
+    /// @brief 获取当前周期任务间隔
+    /// @return 
     unsigned interval() const { return handler_->interval_ns / 1000 / 1000; }
 
     void dump() { TimerManager::instance().dump(); }
