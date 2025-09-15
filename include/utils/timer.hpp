@@ -186,7 +186,7 @@ class TimerManager final {
 
     void quit_and_wait() {
         mtx_tp_.lock();
-        exit_flag_.store(true);
+        exit_flag_ = true;
         mtx_tp_.unlock();
         cond_.notify_all();
 
@@ -217,9 +217,12 @@ class TimerManager final {
             return 0;
         }
 
-        std::lock_guard guard(mtx_heap_);
-        auto next_tp = get_system_ns() + handler->delay_ns;
-        min_heap_.update_place(handler, next_tp);
+        {
+            std::lock_guard guard(mtx_heap_);
+            auto next_tp = get_system_ns() + handler->delay_ns;
+            min_heap_.update_place(handler, next_tp);
+        }
+        set_heap_update_flag();
         return 0;
     }
 
@@ -228,9 +231,12 @@ class TimerManager final {
             return 0;
         }
 
-        std::lock_guard guard(mtx_heap_);
-        auto next_tp = (decltype(handler->next_tp))-1;
-        min_heap_.update_place(handler, next_tp);
+        {
+            std::lock_guard guard(mtx_heap_);
+            auto next_tp = (decltype(handler->next_tp))-1;
+            min_heap_.update_place(handler, next_tp);
+        }
+        set_heap_update_flag();
         return 0;
     }
 
@@ -239,10 +245,13 @@ class TimerManager final {
             return 0;
         }
 
-        std::lock_guard guard(mtx_heap_);
-        handler->interval_ns = ms * 1000 * 1000;
-        auto next_tp = get_system_ns() + handler->interval_ns;
-        min_heap_.update_place(handler, next_tp);
+        {
+            std::lock_guard guard(mtx_heap_);
+            handler->interval_ns = 1000ul * 1000 * ms;
+            auto next_tp = get_system_ns() + handler->interval_ns;
+            min_heap_.update_place(handler, next_tp);
+        }
+        set_heap_update_flag();
         return 0;
     }
 
@@ -258,9 +267,9 @@ class TimerManager final {
         }
 
         std::unique_lock lock(mtx_tp_);
-        wakeup_flag_.store(true);
+        wakeup_flag_ = true;
         if (!exit_flag_) {
-            wakeup_flag_.store(true);
+            wakeup_flag_ = true;
             cond_.notify_one();
         } else {
             cond_.notify_all();
@@ -271,9 +280,9 @@ class TimerManager final {
         while (!exit_flag_) {
             std::unique_lock lock(mtx_tp_);
             ++free_thread_num_;
-            cond_.wait(lock, [this]() -> bool { return exit_flag_ || wakeup_flag_.load(); });
+            cond_.wait(lock, [this]() -> bool { return exit_flag_ || wakeup_flag_; });
             --free_thread_num_;
-            wakeup_flag_.store(false);
+            wakeup_flag_ = false;
             if (exit_flag_) {
                 break;
             }
@@ -293,7 +302,7 @@ class TimerManager final {
 
         //< 去执行定时器任务，执行前需要唤醒一个线程来做当前任务
         std::unique_lock lock(mtx_tp_);
-        wakeup_flag_.store(true);
+        wakeup_flag_ = true;
         cond_.notify_one();
         lock.unlock();
 
@@ -315,23 +324,27 @@ class TimerManager final {
                 continue;
             }
 
-            auto &handler = min_heap_.top();
+            auto handler = min_heap_.top();
             auto curr_ns = get_system_ns();
-            if (handler->next_tp > curr_ns) {
-                lock.unlock();
-                sleep_checker();
-                continue;
+            if (curr_ns >= handler->next_tp) {
+                uint64_t next_tp =
+                    handler->interval_ns == 0 ? -1 : handler->next_tp + handler->interval_ns;
+                min_heap_.update_top(next_tp);
+                //< 正在运行的任务，推迟到下一个周期，防止耗时任务把线程池全部阻塞
+                if (handler->running) {
+                    sl_warn("name: %s is running\n", handler->name.c_str());
+                    continue;
+                }
+                return handler;
             }
+            lock.unlock();
 
-            auto result = handler;
-            uint64_t next_tp = handler->interval_ns == 0 ? -1 : curr_ns + handler->interval_ns;
-            min_heap_.update_top(next_tp);
-            //< 正在运行的任务，推迟到下一个周期，防止耗时任务把线程池全部阻塞
-            if (handler->running) {
-                sl_warn("name: %s is running\n", handler->name.c_str());
-                continue;
-            }
-            return result;
+            std::unique_lock checker_lock(checker_mtx_);
+            auto tp =
+                std::chrono::steady_clock::time_point(std::chrono::nanoseconds(handler->next_tp));
+            checker_cond_.wait_until(
+                checker_lock, tp, [this]() -> bool { return exit_flag_ || heap_update_flag_; });
+            heap_update_flag_ = false;
         }
         return nullptr;
     }
@@ -346,18 +359,27 @@ class TimerManager final {
         return ts.tv_nsec + ts.tv_sec * 1000 * 1000 * 1000;
     }
 
+    inline void set_heap_update_flag() {
+        checker_mtx_.lock();
+        heap_update_flag_ = true;
+        checker_mtx_.unlock();
+    }
+
    private:
     std::mutex mtx_heap_;
     MinHeap min_heap_;
 
+    std::condition_variable checker_cond_;
+    std::mutex checker_mtx_;
+    bool heap_update_flag_ = false;
     //< 线程池
     std::condition_variable cond_;
     std::mutex mtx_tp_;
     std::array<std::thread, max_thread_num> thread_pool_;
-    std::atomic<bool> wakeup_flag_{false};
+    bool wakeup_flag_{false};
     uint8_t free_thread_num_ = 0;
     //< 系统退出
-    std::atomic<bool> exit_flag_{false};
+    bool exit_flag_{false};
 };
 
 /// @brief 定时器对外类
