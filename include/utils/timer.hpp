@@ -35,15 +35,17 @@ struct TimerNode {
     std::string name;
     TimerFunc func;
     uint32_t index = 0;
-    uint32_t interval_ns = 0;
-    uint32_t delay_ns = 0;
+    uint64_t interval_ns = 0;
+    uint64_t delay_ns = 0;
     uint64_t next_tp = (uint64_t)-1;  //< next timepoint
     std::atomic<bool> running{false};
 
     bool operator<(const TimerNode &other) { return next_tp < other.next_tp; }
 
     void dump() {
-        printf("name: %s, index: %u, next tp: %" PRIu64 "\n", name.c_str(), index, next_tp);
+        printf("name: %s, index: %u, interval_ns: %" PRIu64 ", delay_ns: %" PRIu64
+               ", next tp: %" PRIu64 "\n",
+               name.c_str(), index, interval_ns, delay_ns, next_tp);
     }
 };
 
@@ -201,8 +203,8 @@ class TimerManager final {
         auto handler = std::make_shared<TimerNode>();
         handler->func = func;
         handler->name = name;
-        handler->interval_ns = interval_ms * 1000 * 1000;
-        handler->delay_ns = delay_ms * 1000 * 1000;
+        handler->interval_ns = 1000ul * 1000 * interval_ms;
+        handler->delay_ns = 1000ul * 1000 * delay_ms;
         mtx_heap_.lock();
         min_heap_.push(handler);
         mtx_heap_.unlock();
@@ -365,7 +367,7 @@ class Timer {
     /// @param name 定时器名称
     /// @param func 定时器定期执行的任务
     /// @param interval_ms 定时器定期执行任务的周期,如果为0，则只执行一次， 单位为ms
-    /// @param delay_ms 第一次延迟执行的时间，stop后重新start的话也会生效 
+    /// @param delay_ms 第一次延迟执行的时间，stop后重新start的话也会生效
     Timer(const char *name, const TimerFunc &func, unsigned interval_ms, unsigned delay_ms = 0) {
         handler_ = TimerManager::instance().add_timer(name, func, interval_ms, delay_ms);
     }
@@ -374,23 +376,23 @@ class Timer {
     ~Timer() { TimerManager::instance().stop(handler_); }
 
     /// @brief 开始定时器, 对于只执行一次的任务，start后会重新执行
-    /// @return 
+    /// @return
     int start() { return TimerManager::instance().start(handler_); }
 
     /// @brief 停止定时器
-    /// @return 
+    /// @return
     int stop() { return TimerManager::instance().stop(handler_); }
 
     /// @brief 设置周期任务间隔
-    /// @param ms 
-    /// @return 
+    /// @param ms
+    /// @return
     int set_interval(unsigned ms) { return TimerManager::instance().set_interval(handler_, ms); }
 
     /// @brief 获取当前周期任务间隔
-    /// @return 
+    /// @return
     unsigned interval() const { return handler_->interval_ns / 1000 / 1000; }
 
-    void dump() { TimerManager::instance().dump(); }
+    void dump() { handler_->dump(); }
 
    private:
     TimerHandler handler_;
