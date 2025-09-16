@@ -32,12 +32,24 @@ namespace stroll {
 using TimerFunc = std::function<void()>;
 
 struct TimerNode {
+    static const uint64_t kMaxTimePoint = 0x7ffffffffffffffful;
+
+    class RunningGuard {
+       public:
+        RunningGuard(std::atomic<bool> &flag) : flag_(flag) { flag_ = true; }
+
+        ~RunningGuard() { flag_ = false; }
+
+       private:
+        std::atomic<bool> &flag_;
+    };
+
     std::string name;
     TimerFunc func;
     uint32_t index = 0;
     uint64_t interval_ns = 0;
     uint64_t delay_ns = 0;
-    uint64_t next_tp = (uint64_t)-1;  //< next timepoint
+    uint64_t next_tp = kMaxTimePoint;  //< next timepoint
     std::atomic<bool> running{false};
 
     bool operator<(const TimerNode &other) { return next_tp < other.next_tp; }
@@ -52,7 +64,7 @@ struct TimerNode {
 using TimerHandler = std::shared_ptr<TimerNode>;
 using ConstTimerHandler = std::shared_ptr<const TimerNode>;
 
-inline bool operator<(const TimerHandler &left, const TimerHandler &right) {
+static inline bool operator<(const TimerHandler &left, const TimerHandler &right) {
     // std::cout << "left: " << left->next_tp << " right: " << right->next_tp << std::endl;
     return left->next_tp < right->next_tp;
 }
@@ -174,7 +186,6 @@ class MinHeap {
 
 class TimerManager final {
     static const unsigned max_thread_num = 4;
-    static const unsigned check_interval_ms = 1;
 
    public:
     static TimerManager &instance() {
@@ -182,29 +193,15 @@ class TimerManager final {
         return _inst;
     }
 
-    ~TimerManager() {}
-
-    void quit_and_wait() {
-        mtx_tp_.lock();
-        exit_flag_ = true;
-        mtx_tp_.unlock();
-        cond_.notify_all();
-
-        for (auto i = 0u; i < max_thread_num; ++i) {
-            auto &thr = thread_pool_[i];
-            if (thr.joinable()) {
-                thr.join();
-            }
-        }
-    }
+    ~TimerManager() { quit_and_wait(); }
 
     TimerHandler add_timer(const char *name, const TimerFunc &func, unsigned interval_ms,
                            unsigned delay_ms) {
         auto handler = std::make_shared<TimerNode>();
         handler->func = func;
         handler->name = name;
-        handler->interval_ns = 1000ul * 1000 * interval_ms;
-        handler->delay_ns = 1000ul * 1000 * delay_ms;
+        handler->interval_ns = 1000ull * 1000 * interval_ms;
+        handler->delay_ns = 1000ull * 1000 * delay_ms;
         mtx_heap_.lock();
         min_heap_.push(handler);
         mtx_heap_.unlock();
@@ -233,7 +230,7 @@ class TimerManager final {
 
         {
             std::lock_guard guard(mtx_heap_);
-            auto next_tp = (decltype(handler->next_tp))-1;
+            auto next_tp = TimerNode::kMaxTimePoint;
             min_heap_.update_place(handler, next_tp);
         }
         set_heap_update_flag();
@@ -247,7 +244,7 @@ class TimerManager final {
 
         {
             std::lock_guard guard(mtx_heap_);
-            handler->interval_ns = 1000ul * 1000 * ms;
+            handler->interval_ns = 1000ull * 1000 * ms;
             auto next_tp = get_system_ns() + handler->interval_ns;
             min_heap_.update_place(handler, next_tp);
         }
@@ -256,7 +253,7 @@ class TimerManager final {
     }
 
     void dump() {
-        sl_info("curr ts: %" PRIu64 "\n", get_system_ns());
+        sl_info("free thread number:%d \n", free_thread_num_);
         min_heap_.dump();
     }
 
@@ -269,7 +266,6 @@ class TimerManager final {
         std::unique_lock lock(mtx_tp_);
         wakeup_flag_ = true;
         if (!exit_flag_) {
-            wakeup_flag_ = true;
             cond_.notify_one();
         } else {
             cond_.notify_all();
@@ -278,20 +274,23 @@ class TimerManager final {
 
     void on_work() {
         while (!exit_flag_) {
-            std::unique_lock lock(mtx_tp_);
-            ++free_thread_num_;
-            cond_.wait(lock, [this]() -> bool { return exit_flag_ || wakeup_flag_; });
-            --free_thread_num_;
-            wakeup_flag_ = false;
-            if (exit_flag_) {
-                break;
+            //< 线程先统一阻塞，等待唤醒一个线程做为检测线程
+            {
+                std::unique_lock lock(mtx_tp_);
+                ++free_thread_num_;
+                cond_.wait(lock, [this]() -> bool { return exit_flag_ || wakeup_flag_; });
+                --free_thread_num_;
+                wakeup_flag_ = false;
+                if (exit_flag_) {
+                    ++free_thread_num_;
+                    break;
+                }
             }
-            lock.unlock();
 
             //< 检查定时任务
             check_and_dispatch();
         }
-        sl_warn("timer thread pool exit\n");
+        sl_warn("timer thread pool exit, free_thread_num: %u\n", free_thread_num_);
     }
 
     void check_and_dispatch() {
@@ -301,18 +300,18 @@ class TimerManager final {
         }
 
         //< 去执行定时器任务，执行前需要唤醒一个线程来做当前任务
-        std::unique_lock lock(mtx_tp_);
-        wakeup_flag_ = true;
-        cond_.notify_one();
-        lock.unlock();
+        {
+            std::unique_lock lock(mtx_tp_);
+            wakeup_flag_ = true;
+            cond_.notify_one();
+        }
 
-        handler->running = true;
+        TimerNode::RunningGuard running_guard(handler->running);
         if (handler->func) {
             handler->func();
         } else {
             sl_warn("name: %s no callback func\n", handler->name.c_str());
         }
-        handler->running = false;
     }
 
     TimerHandler check_task() {
@@ -320,15 +319,16 @@ class TimerManager final {
             std::unique_lock lock(mtx_heap_);
             if (min_heap_.empty()) {
                 lock.unlock();
-                sleep_checker(10);
+                //< 等待定时任务加入
+                sleep_checker_for(TimerNode::kMaxTimePoint);
                 continue;
             }
 
             auto handler = min_heap_.top();
-            auto curr_ns = get_system_ns();
-            if (curr_ns >= handler->next_tp) {
-                uint64_t next_tp =
-                    handler->interval_ns == 0 ? -1 : handler->next_tp + handler->interval_ns;
+            if (get_system_ns() >= handler->next_tp) {
+                uint64_t next_tp = handler->interval_ns == 0
+                                       ? TimerNode::kMaxTimePoint
+                                       : handler->next_tp + handler->interval_ns;
                 min_heap_.update_top(next_tp);
                 //< 正在运行的任务，推迟到下一个周期，防止耗时任务把线程池全部阻塞
                 if (handler->running) {
@@ -339,30 +339,51 @@ class TimerManager final {
             }
             lock.unlock();
 
-            std::unique_lock checker_lock(checker_mtx_);
-            auto tp =
-                std::chrono::steady_clock::time_point(std::chrono::nanoseconds(handler->next_tp));
-            checker_cond_.wait_until(
-                checker_lock, tp, [this]() -> bool { return exit_flag_ || heap_update_flag_; });
-            heap_update_flag_ = false;
+            //< 等待定时任务到期
+            sleep_checker_for(handler->next_tp);
         }
         return nullptr;
     }
 
-    inline void sleep_checker(unsigned times = check_interval_ms) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(times));
+    void sleep_checker_for(uint64_t next_tp) {
+        auto func = [this]() -> bool { return exit_flag_ || heap_update_flag_; };
+
+        std::unique_lock checker_lock(checker_mtx_);
+        if (next_tp != TimerNode::kMaxTimePoint) {
+            auto tp = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(next_tp));
+            checker_cond_.wait_until(checker_lock, tp, func);
+        } else {
+            checker_cond_.wait(checker_lock, func);
+        }
+        heap_update_flag_ = false;
     }
 
-    inline uint64_t get_system_ns() {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return ts.tv_nsec + ts.tv_sec * 1000 * 1000 * 1000;
+    uint64_t get_system_ns() {
+        return std::chrono::steady_clock::now().time_since_epoch().count();
     }
 
-    inline void set_heap_update_flag() {
-        checker_mtx_.lock();
+    void set_heap_update_flag() {
+        std::unique_lock lock(checker_mtx_);
         heap_update_flag_ = true;
-        checker_mtx_.unlock();
+        checker_cond_.notify_one();
+    }
+
+    void quit_and_wait() {
+        mtx_tp_.lock();
+        exit_flag_ = true;
+        cond_.notify_all();
+        mtx_tp_.unlock();
+
+        //< 唤醒等待的检查器，准备退出
+        set_heap_update_flag();
+
+        //< 等待所有线程退出
+        for (auto i = 0u; i < max_thread_num; ++i) {
+            auto &thr = thread_pool_[i];
+            if (thr.joinable()) {
+                thr.join();
+            }
+        }
     }
 
    private:

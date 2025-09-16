@@ -87,22 +87,23 @@ void test_min_heap_place() {
 void test_timer() {
     auto func = []() { sl_info("test func\n"); };
 
-    auto timer = new Timer("test func", func, 2000);
+    auto timer = new Timer("test func", func, 5000);
+    getchar();
     timer->start();
 
- 
     auto func_other = []() { sl_info("other func\n"); };
     auto timer_other = new Timer("other func", func_other, 3000, 2000);
     timer_other->start();
     getchar();
 
+    sl_info("timer->set_interval(1000) and timer_other->stop\n");
     timer_other->stop();
     timer->set_interval(1000);
     getchar();
-
+    sl_info("timer_other->start()\n");
     timer_other->start();
+    timer_other->set_interval(10 * 1000);
     getchar();
-    TimerManager::instance().quit_and_wait();
 }
 
 int main() {
